@@ -22,16 +22,42 @@ ACTION_HISTORY_FILE = "action_history.json"
 ADMIN_PIN = "sidhu-amg"  # Change this in production
 
 # --- SESSION STATE INITIALIZATION ---
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-if "last_update" not in st.session_state:
-    st.session_state["last_update"] = time.time()
-if "ball_by_ball" not in st.session_state:
-    st.session_state["ball_by_ball"] = []
-if "match_events" not in st.session_state:
-    st.session_state["match_events"] = []
-if "action_history" not in st.session_state:
-    st.session_state["action_history"] = []
+def initialize_session_state():
+    """Initialize all session state variables"""
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+    if "last_update" not in st.session_state:
+        st.session_state["last_update"] = time.time()
+    if "last_rerun" not in st.session_state:
+        st.session_state["last_rerun"] = 0
+    if "ball_by_ball" not in st.session_state:
+        st.session_state["ball_by_ball"] = []
+    if "match_events" not in st.session_state:
+        st.session_state["match_events"] = []
+    if "action_history" not in st.session_state:
+        st.session_state["action_history"] = []
+    if "debug_messages" not in st.session_state:
+        st.session_state["debug_messages"] = []
+
+# Initialize session state immediately
+initialize_session_state()
+
+# --- PERSISTENT AUTHENTICATION ---
+def check_persistent_auth():
+    """Check for persistent authentication using query params"""
+    # Check if there's a auth token in query params
+    try:
+        query_params = st.query_params
+        if "auth" in query_params and query_params["auth"] == "admin":
+            st.session_state["authenticated"] = True
+            # Clear the query param for security
+            st.query_params.clear()
+    except Exception:
+        # Fallback if query_params not available
+        pass
+
+# Check persistent auth on every run
+check_persistent_auth()
 
 # --- DATA MANAGEMENT CLASS ---
 class CricketDataManager:
@@ -75,9 +101,21 @@ class CricketDataManager:
         # Load current data before saving for undo functionality
         current_data = CricketDataManager.load_data()
         
-        # Save the new data
-        with open(DB_FILE, "w") as f:
-            json.dump(data, f, indent=4)
+        # Save the new data with comprehensive error handling
+        try:
+            with open(DB_FILE, "w") as f:
+                json.dump(data, f, indent=4)
+        except PermissionError:
+            raise Exception("❌ Permission denied: Cannot write to data file. Check file permissions.")
+        except OSError as e:
+            if "No space left" in str(e):
+                raise Exception("❌ Disk full: Cannot save data. Free up disk space.")
+            elif "Device full" in str(e):
+                raise Exception("❌ Disk full: Cannot save data. Free up disk space.")
+            else:
+                raise Exception(f"❌ File system error: {e}")
+        except Exception as e:
+            raise Exception(f"❌ Save failed: {e}")
         
         # Save action for undo (only if data actually changed)
         if current_data != data:
@@ -87,12 +125,21 @@ class CricketDataManager:
     def save_to_history(data):
         history_file = "history.json"
         history = []
+        
+        # Load existing history with error handling
         if os.path.exists(history_file):
-            with open(history_file, "r") as f:
-                try: 
+            try:
+                with open(history_file, "r") as f:
                     history = json.load(f)
-                except: 
-                    history = []
+            except PermissionError:
+                st.error("❌ Cannot read history: File locked by another process.")
+                return
+            except json.JSONDecodeError:
+                st.warning("⚠️ History file corrupted, creating new history.")
+                history = []
+            except Exception as e:
+                st.error(f"❌ History load failed: {e}")
+                history = []
         
         # Calculate economy rates and strike rates
         batting_performance = []
@@ -129,10 +176,29 @@ class CricketDataManager:
             "man_of_match": CricketDataManager.get_man_of_match(data)
         }
         
+        # Save with file locking and error handling
         if not history or history[-1].get("match_id") != match_summary["match_id"]:
             history.append(match_summary)
-            with open(history_file, "w") as f:
-                json.dump(history, f, indent=4)
+            try:
+                # Use file locking to prevent concurrent access
+                import fcntl
+                with open(history_file, "w") as f:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                    json.dump(history, f, indent=4)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                # Fallback for Windows systems
+                with open(history_file, "w") as f:
+                    json.dump(history, f, indent=4)
+            except PermissionError:
+                st.error("❌ Cannot save history: File is locked or permission denied.")
+            except OSError as e:
+                if "No space left" in str(e) or "Device full" in str(e):
+                    st.error("❌ Disk full: Cannot save history. Free up disk space.")
+                else:
+                    st.error(f"❌ History save failed: {e}")
+            except Exception as e:
+                st.error(f"❌ Unexpected error saving history: {e}")
     
     @staticmethod
     def get_man_of_match(data):
@@ -162,31 +228,68 @@ class CricketDataManager:
     def save_action(action_type, description, previous_data):
         """Save action to history for undo functionality"""
         action_history = []
-        if os.path.exists(ACTION_HISTORY_FILE):
-            with open(ACTION_HISTORY_FILE, "r") as f:
-                try:
+        
+        # Load existing action history with memory management
+        try:
+            if os.path.exists(ACTION_HISTORY_FILE):
+                with open(ACTION_HISTORY_FILE, "r") as f:
                     action_history = json.load(f)
-                except:
-                    action_history = []
+                    
+                    # Memory management: limit history size
+                    if len(action_history) > 50:  # Reduced from 100 to prevent memory overflow
+                        action_history = action_history[-50:]  # Keep only last 50 actions
+                        st.warning("⚠️ Action history trimmed to prevent memory overflow.")
+        except json.JSONDecodeError:
+            st.warning("⚠️ Action history corrupted, starting fresh.")
+            action_history = []
+        except Exception as e:
+            st.error(f"❌ Action history load failed: {e}")
+            action_history = []
+        
+        # Validate player names in previous_data
+        if previous_data:
+            for stats_type in ["batting_stats", "bowling_stats"]:
+                if stats_type in previous_data:
+                    invalid_players = []
+                    for player_name in previous_data[stats_type].keys():
+                        if not player_name or not isinstance(player_name, str):
+                            invalid_players.append(player_name)
+                    
+                    if invalid_players:
+                        st.warning(f"⚠️ Invalid player names found: {invalid_players}")
         
         action = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "action_type": action_type,
             "description": description,
-            "previous_data": previous_data.copy()
+            "previous_data": previous_data.copy() if previous_data else {}
         }
         
         action_history.append(action)
         
-        # Keep only last 10 actions
+        # Keep only last 10 actions (reduced for performance)
         if len(action_history) > 10:
             action_history = action_history[-10:]
         
-        with open(ACTION_HISTORY_FILE, "w") as f:
-            json.dump(action_history, f, indent=4)
+        # Save with error handling
+        try:
+            with open(ACTION_HISTORY_FILE, "w") as f:
+                json.dump(action_history, f, indent=4)
+        except PermissionError:
+            st.error("❌ Cannot save action: File locked or permission denied.")
+        except OSError as e:
+            if "No space left" in str(e) or "Device full" in str(e):
+                st.error("❌ Disk full: Cannot save action history.")
+            else:
+                st.error(f"❌ Action save failed: {e}")
+        except Exception as e:
+            st.error(f"❌ Unexpected error saving action: {e}")
         
-        # Update session state
-        st.session_state["action_history"] = action_history
+        # Update session state with memory management
+        try:
+            st.session_state["action_history"] = action_history
+        except Exception:
+            pass  # Fallback if session state unavailable
     
     @staticmethod
     def load_action_history():
@@ -210,13 +313,48 @@ class CricketDataManager:
         previous_data = last_action["previous_data"]
         
         # Restore previous data
-        with open(DB_FILE, "w") as f:
-            json.dump(previous_data, f, indent=4)
+        try:
+            with open(DB_FILE, "w") as f:
+                json.dump(previous_data, f, indent=4)
+        except Exception as e:
+            return False, f"Failed to restore data: {e}"
+        
+        # Restore ball_by_ball data from session state or recreate it
+        try:
+            # Calculate ball_by_ball from restored data
+            restored_ball_by_ball = []
+            if previous_data and "balls" in previous_data:
+                # Recreate ball_by_ball data based on restored match state
+                total_balls = previous_data["balls"]
+                current_over = total_balls // 6 + 1 if total_balls > 0 else 1
+                
+                # For now, create empty ball_by_ball to ensure correct over display
+                # The actual ball history will be rebuilt as new balls are played
+                restored_ball_by_ball = []
+            
+            # Update session state
+            st.session_state["ball_by_ball"] = restored_ball_by_ball
+            
+            # Save ball_by_ball to file
+            with open("ball_by_ball.json", "w") as f:
+                json.dump(restored_ball_by_ball, f, indent=4)
+                
+        except Exception as e:
+            # If ball_by_ball restore fails, at least clear it to prevent wrong display
+            try:
+                st.session_state["ball_by_ball"] = []
+                with open("ball_by_ball.json", "w") as f:
+                    json.dump([], f, indent=4)
+            except:
+                pass
         
         # Remove the last action from history
         action_history = action_history[:-1]
-        with open(ACTION_HISTORY_FILE, "w") as f:
-            json.dump(action_history, f, indent=4)
+        try:
+            with open(ACTION_HISTORY_FILE, "w") as f:
+                json.dump(action_history, f, indent=4)
+        except Exception as e:
+            return False, f"Failed to update action history: {e}"
         
         st.session_state["action_history"] = action_history
         return True, f"Undone: {last_action['description']}"
@@ -336,6 +474,80 @@ def apply_custom_css():
             border-radius: 5px;
             transition: width 0.5s ease;
         }
+        
+        .over-balls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        .ball-circle {
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            border: 2px solid #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 9px;
+            font-weight: bold;
+            color: #000;
+            background: rgba(255, 255, 255, 0.1);
+        }
+        
+        .ball-unplayed {
+            background: rgba(255, 255, 255, 0.1);
+            color: transparent;
+        }
+        
+        .ball-played {
+            background: #888;
+            color: #fff;
+        }
+        
+        .ball-four {
+            background: #28a745;
+            color: #fff;
+        }
+        
+        .ball-six {
+            background: #6f42c1;
+            color: #fff;
+        }
+        
+        .ball-wicket {
+            background: #dc3545;
+            color: #fff;
+        }
+        
+        .ball-extra {
+            background: #fd7e14;
+            color: #fff;
+        }
+        
+        .ball-numbers {
+            display: flex;
+            justify-content: center;
+            gap: 12px; /* Match the gap of over-balls */
+            margin-top: 5px; /* Small margin to separate from balls */
+        }
+        
+        .ball-numbers div {
+            width: 35px; /* Match ball-circle width */
+            text-align: center;
+            font-size: 10px;
+            color: #ccc;
+        }
+        
+        .over-container {
+            background: linear-gradient(135deg, #141E30 0%, #243B55 100%);
+            padding: 15px;
+            border-radius: 15px;
+            border: 2px solid #ff4b4b;
+            margin-top: -10px;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -355,11 +567,154 @@ def add_match_event(event_type, description, data):
         "data": data
     })
 
+def generate_over_balls_display(data):
+    """Generate HTML for current over balls display"""
+    try:
+        ball_by_ball_data = st.session_state.get("ball_by_ball", [])
+    except Exception as e:
+        st.error(f"Error accessing session state: {e}")
+        return ""
+
+    # Always show 6 circles, even if no balls bowled
+    if not ball_by_ball_data:
+        balls_html = ""
+        ball_numbers_html = ""
+        for i in range(6):
+            balls_html += '<div class="ball-circle ball-unplayed"></div>'
+            ball_numbers_html += f'<div>{i+1}</div>'
+        
+        return f'''
+        <div class="over-container">
+            <div class="over-balls">
+                {balls_html}
+            </div>
+            <div class="ball-numbers">
+                {ball_numbers_html}
+            </div>
+        </div>
+    '''
+    
+    # Get current over number
+    total_balls = data["balls"]
+    current_over = total_balls // 6 + 1
+    
+    # Filter balls from current over
+    current_over_balls = []
+    for ball in st.session_state["ball_by_ball"]:
+        if ball["over"] == current_over:
+            current_over_balls.append(ball)
+    
+    # If no balls in current over, show empty circles
+    if not current_over_balls:
+        balls_html = ""
+        ball_numbers_html = ""
+        for i in range(6):
+            balls_html += '<div class="ball-circle ball-unplayed"></div>'
+            ball_numbers_html += f'<div>{i+1}</div>'
+        
+        return f'''
+        <div class="over-container">
+            <div class="over-balls">
+                {balls_html}
+            </div>
+            <div class="ball-numbers">
+                {ball_numbers_html}
+            </div>
+        </div>
+    '''
+    
+    # Generate HTML for balls
+    balls_html = ""
+    ball_numbers_html = ""
+    
+    # Count legal balls and extras
+    legal_ball_count = 0
+    total_display_balls = 0
+    
+    # Process balls in order
+    for ball in current_over_balls:
+        if ball["ball_type"] not in ["Wide", "No Ball"]:
+            legal_ball_count += 1
+            total_display_balls += 1
+            
+            # Determine ball class and content
+            ball_class = "ball-circle "
+            ball_content = ""
+            
+            if ball["ball_type"] == "Wide":
+                ball_class += "ball-extra"
+                ball_content = "Wd"
+            elif ball["ball_type"] == "No Ball":
+                ball_class += "ball-extra"
+                ball_content = "Nb"
+            elif ball["ball_type"] == "Bye":
+                ball_class += "ball-played"
+                ball_content = f"Bye{ball['runs']}"
+            elif ball["ball_type"] == "Leg Bye":
+                ball_class += "ball-played"
+                ball_content = f"LB{ball['runs']}"
+            elif ball.get("is_wicket", False):
+                ball_class += "ball-wicket"
+                ball_content = "W"
+            elif ball["runs"] == 4:
+                ball_class += "ball-four"
+                ball_content = "4"
+            elif ball["runs"] == 6:
+                ball_class += "ball-six"
+                ball_content = "6"
+            elif ball["runs"] == 0:
+                ball_class += "ball-played"
+                ball_content = "•"
+            else:  # 1, 2, 3 runs
+                ball_class += "ball-played"
+                ball_content = str(ball["runs"])
+            
+            balls_html += f'<div class="{ball_class}">{ball_content}</div>'
+            ball_numbers_html += f'<div>{total_display_balls}</div>'
+            
+            # Stop if we have 6 legal balls
+            if legal_ball_count >= 6:
+                break
+        else:
+            # Handle Wide and No Ball as extras
+            total_display_balls += 1
+            ball_class = "ball-circle ball-extra"
+            ball_content = "Wd" if ball["ball_type"] == "Wide" else "Nb"
+            
+            balls_html += f'<div class="{ball_class}">{ball_content}</div>'
+            ball_numbers_html += f'<div>{total_display_balls}</div>'
+    
+    # Add remaining unplayed balls (up to 6 legal balls)
+    remaining_legal = 6 - legal_ball_count
+    for i in range(remaining_legal):
+        balls_html += '<div class="ball-circle ball-unplayed"></div>'
+        ball_numbers_html += f'<div>{total_display_balls + i + 1}</div>'
+    
+    return f'''
+        <div class="over-container">
+            <div class="over-balls">
+                {balls_html}
+            </div>
+            <div class="ball-numbers">
+                {ball_numbers_html}
+            </div>
+        </div>
+    '''
+
 # Load data
 data = CricketDataManager.load_data()
 
 # Load action history after class is defined
 st.session_state["action_history"] = CricketDataManager.load_action_history()
+
+# Load ball_by_ball data from file if exists
+if os.path.exists("ball_by_ball.json"):
+    try:
+        with open("ball_by_ball.json", "r") as f:
+            st.session_state["ball_by_ball"] = json.load(f)
+    except Exception as e:
+        st.warning(f"⚠️ Could not load ball data: {e}")
+        st.session_state["ball_by_ball"] = []
 
 apply_custom_css()
 
@@ -397,10 +752,42 @@ if page == "⚙️ Admin Panel":
             submitted = st.form_submit_button("Login")
             if submitted and pwd == ADMIN_PIN:
                 st.session_state["authenticated"] = True
+                # Set persistent auth
+                try:
+                    st.query_params["auth"] = "admin"
+                except Exception:
+                    pass  # Fallback if query_params not available
                 st.rerun()
             elif submitted:
                 st.error("Invalid PIN")
     else:
+        # Admin Header with Logout
+        col_logout1, col_logout2 = st.columns([3, 1])
+        with col_logout1:
+            st.success("🔓 Admin Access Granted")
+        with col_logout2:
+            if st.button("🚪 LOGOUT", type="secondary", use_container_width=True):
+                st.session_state["authenticated"] = False
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass  # Fallback if query_params not available
+                st.rerun()
+        
+        st.divider()
+        
+        # Debug Messages Section
+        st.subheader("🔍 Debug Messages")
+        if st.session_state.get("debug_messages"):
+            st.write("**Recent Ball Submissions:**")
+            for msg in st.session_state["debug_messages"][-10:]:  # Show last 10 messages
+                st.write(f"• {msg}")
+            if st.button("Clear Debug Messages"):
+                st.session_state["debug_messages"] = []
+                st.rerun()
+        else:
+            st.info("No debug messages yet. Submit some balls to see debug info.")
+        
         # Undo Section at the top
         st.subheader("🔄 Undo Actions")
         action_history = st.session_state.get("action_history", [])
@@ -433,7 +820,7 @@ if page == "⚙️ Admin Panel":
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader(f"⚔️ {data['team_a']} - Squad")
+                st.subheader(f"⚔️ {data['team_a']} - Team")
                 with st.form("team_a_form"):
                     new_player = st.text_input(f"Add Player to {data['team_a']}")
                     if st.form_submit_button("➕ Add Player"):
@@ -455,7 +842,7 @@ if page == "⚙️ Admin Panel":
                             st.rerun()
             
             with col2:
-                st.subheader(f"⚔️ {data['team_b']} - Squad")
+                st.subheader(f"⚔️ {data['team_b']} - Team")
                 with st.form("team_b_form"):
                     new_player = st.text_input(f"Add Player to {data['team_b']}")
                     if st.form_submit_button("➕ Add Player"):
@@ -524,8 +911,12 @@ if page == "⚙️ Admin Panel":
                 if st.button("Reset Match", type="secondary", use_container_width=True):
                     if os.path.exists(DB_FILE):
                         os.remove(DB_FILE)
+                    # Clear ball_by_ball data and file
                     st.session_state["ball_by_ball"] = []
                     st.session_state["match_events"] = []
+                    # Delete ball_by_ball.json file to clear circles
+                    if os.path.exists("ball_by_ball.json"):
+                        os.remove("ball_by_ball.json")
                     st.success("Match Reset Complete!")
                     st.rerun()
             
@@ -612,6 +1003,11 @@ if page == "⚙️ Admin Panel":
                         else:
                             actual_runs = int(runs)
                             data["score"] += actual_runs
+                            
+                            # Ensure striker exists in batting stats
+                            if striker not in data["batting_stats"]:
+                                data["batting_stats"][striker] = {"r": 0, "b": 0, "4s": 0, "6s": 0}
+                            
                             data["batting_stats"][striker]["r"] += actual_runs
                             data["batting_stats"][striker]["b"] += 1
                             if actual_runs == 4:
@@ -620,6 +1016,11 @@ if page == "⚙️ Admin Panel":
                             elif actual_runs == 6:
                                 data["batting_stats"][striker]["6s"] += 1
                                 add_match_event("SIX", f"{striker} hits a SIX! {actual_runs} runs", {})
+                            
+                            # Ensure bowler exists in bowling stats
+                            if bowler not in data["bowling_stats"]:
+                                data["bowling_stats"][bowler] = {"r": 0, "w": 0, "balls": 0}
+                            
                             data["bowling_stats"][bowler]["r"] += actual_runs
                             data["bowling_stats"][bowler]["over_runs"] = data["bowling_stats"][bowler].get("over_runs", 0) + actual_runs
                         
@@ -641,9 +1042,10 @@ if page == "⚙️ Admin Panel":
                                 data["partnership_balls"] += 1
                         
                         # Create ball record for all ball types
+                        current_balls = data["balls"]
                         ball_record = {
-                            "over": data["balls"] // 6 + 1,
-                            "ball": data["balls"] % 6 if data["balls"] % 6 != 0 else 6,
+                            "over": current_balls // 6 + 1,
+                            "ball": current_balls % 6 if current_balls % 6 != 0 else 6,
                             "bowler": bowler,
                             "striker": striker,
                             "runs": actual_runs,
@@ -651,6 +1053,15 @@ if page == "⚙️ Admin Panel":
                             "ball_type": ball_type
                         }
                         st.session_state["ball_by_ball"].append(ball_record)
+                        # Save ball_by_ball to file for persistence
+                        try:
+                            with open("ball_by_ball.json", "w") as f:
+                                json.dump(st.session_state["ball_by_ball"], f, indent=4)
+                        except Exception as e:
+                            # Only show error in admin panel
+                            if page == "⚙️ Admin Panel":
+                                st.error(f"⚠️ Could not save ball data: {e}")
+                            # Continue without saving to file (data stays in session)
                         
                         data["overs"] = data["balls"] // 6 + (data["balls"] % 6) / 10
                         data["run_rate"] = calculate_run_rate(data["score"], data["balls"])
@@ -856,7 +1267,7 @@ elif page == "📺 Live Match":
             target_text = f"""
                 <div class='target-box'>
                     🎯 TARGET: {data['target']} | NEED {runs_needed} RUNS IN {balls_left} BALLS
-                    <br>RRR: {required_run_rate:.2f} | CRR: {data['run_rate']:.2f} | WKTS LEFT: {wickets_left}
+                    <br>Required Run Rate: {required_run_rate:.2f} | Current Run Rate: {data['run_rate']:.2f} | WKTS LEFT: {wickets_left}
                 </div>
             """
     
@@ -866,9 +1277,29 @@ elif page == "📺 Live Match":
             <h1 style='font-size: 100px; margin: 10px 0;'>{data['score']}/{data['wickets']}</h1>
             <p style='font-size: 24px;'>Overs: {data['overs']:.1f} / {data['max_overs']}</p>
             <p style='font-size: 20px;'>Current Run Rate: {data['run_rate']:.2f}</p>
-            {target_text}
         </div>
     """, unsafe_allow_html=True)
+    
+    # Display over balls separately after the main score banner
+    try:
+        over_balls_html = generate_over_balls_display(data)
+        if over_balls_html:
+            st.markdown(over_balls_html, unsafe_allow_html=True)
+    except Exception as e:
+        # Silent fallback for viewer page
+        if page == "⚙️ Admin Panel":
+            st.error(f"⚠️ Over display error: {e}")
+        else:
+            # Show simple fallback for viewer
+            st.markdown("""
+            <div style="background: #333; padding: 10px; border-radius: 10px; text-align: center; color: #ccc; margin: 10px 0;">
+                ⚠️ Live score temporarily unavailable
+            </div>
+            """, unsafe_allow_html=True)
+    
+    # Display target box separately if it exists
+    if target_text:
+        st.markdown(target_text, unsafe_allow_html=True)
     
     # Current Players Display
     if not data["is_finished"]:
@@ -944,7 +1375,7 @@ elif page == "📺 Live Match":
     st.divider()
     
     # Detailed Stats Tabs
-    tab_match, tab_bat, tab_bowl, tab_squad, tab_commentary = st.tabs(["📊 Match Stats", "🏏 Batting", "🎯 Bowling", "👥 Squad", "📝 Commentary"])
+    tab_match, tab_bat, tab_bowl, tab_squad, tab_commentary = st.tabs(["📊 Match Stats", "🏏 Batting", "🎯 Bowling", "👥 Team", "📝 Commentary"])
     
     with tab_match:
         col_info1, col_info2 = st.columns(2)
@@ -1021,7 +1452,7 @@ elif page == "📺 Live Match":
         col_sq1, col_sq2 = st.columns(2)
         
         with col_sq1:
-            st.subheader(f"{batting_team} Squad")
+            st.subheader(f"{batting_team} Team")
             batting_squad = data["team_a_squad"] if data["innings"] == 1 else data["team_b_squad"]
             for player in batting_squad:
                 if player in data["out_players"]:
@@ -1032,7 +1463,7 @@ elif page == "📺 Live Match":
                     st.write(f"• {player}")
         
         with col_sq2:
-            st.subheader(f"{bowling_team} Squad")
+            st.subheader(f"{bowling_team} Team")
             bowling_squad = data["team_b_squad"] if data["innings"] == 1 else data["team_a_squad"]
             for player in bowling_squad:
                 if player == data["current_bowler"]:
@@ -1153,9 +1584,18 @@ elif page == "📜 History":
     else:
         st.info("No match history available yet. Complete a match to see history!")
 
-# Auto-refresh for live match page
+# Auto-refresh for live match page with optimization
 if page == "📺 Live Match" and not data["is_finished"]:
-    if time.time() - st.session_state["last_update"] > 5:  # Refresh every 5 seconds
-        st.session_state["last_update"] = time.time()
+    # Rate limiting to prevent infinite refresh loops
+    current_time = time.time()
+    last_rerun = st.session_state.get("last_rerun", 0)
+    
+    # Only refresh if 5 seconds have passed since last rerun
+    if current_time - st.session_state["last_update"] > 5 and current_time - last_rerun > 6:
+        st.session_state["last_update"] = current_time
+        st.session_state["last_rerun"] = current_time
         time.sleep(0.1)  # Small delay to prevent multiple refreshes
         st.rerun()
+    elif current_time - st.session_state["last_update"] <= 5:
+        # Update time but don't rerun (prevents rapid refreshes)
+        st.session_state["last_update"] = current_time
